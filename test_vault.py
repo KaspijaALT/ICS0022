@@ -8,7 +8,14 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from main import JsonLogFormatter, main as run_cli
+from main import (
+    ACCOUNT_DIRECTORY,
+    JsonLogFormatter,
+    check_account,
+    main as run_cli,
+    vault_path,
+)
+from types import SimpleNamespace
 from storage import (
     Vault,
     VaultError,
@@ -123,6 +130,21 @@ class VaultTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertIn("File operation failed.", error_output.getvalue())
         self.assertNotIn("private path", error_output.getvalue())
+
+    def test_account_names_are_validated(self):
+        for account in ("bad name", "x" * 65, ""):
+            with self.subTest(account=account), self.assertRaises(VaultError):
+                check_account(account)
+        self.assertEqual(check_account("alice_1"), "alice_1")
+
+    def test_account_vault_paths_are_separate(self):
+        args = SimpleNamespace(account="alice", vault="unused.pvlt")
+        alice_path = vault_path(args)
+        args.account = "bob"
+        bob_path = vault_path(args)
+        self.assertNotEqual(alice_path, bob_path)
+        self.assertTrue(alice_path.startswith(ACCOUNT_DIRECTORY + os.sep))
+        self.assertTrue(bob_path.startswith(ACCOUNT_DIRECTORY + os.sep))
 
 
 if __name__ == "__main__":

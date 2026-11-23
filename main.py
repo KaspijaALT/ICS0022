@@ -4,6 +4,7 @@ import getpass
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -12,10 +13,18 @@ import time
 from storage import Vault, VaultError, check_label, check_password, check_username
 
 DEFAULT_VAULT = os.path.expanduser("~/.spm/vault.pvlt")
+ACCOUNT_DIRECTORY = os.path.expanduser("~/.spm/vaults")
+ACCOUNT_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}")
 MIN_MASTER_LENGTH = 12
 CLIPBOARD_SECONDS = 20
 SESSION_HELP = "Commands: list | get <label> | copy <label> | add <label> [username] | delete <label> | exit"
 logger = logging.getLogger("spm.audit")
+
+
+def check_account(account):
+    if not isinstance(account, str) or not ACCOUNT_PATTERN.fullmatch(account):
+        raise VaultError("Account name may only use letters, digits and . _ - (max 64 characters).")
+    return account
 
 
 class JsonLogFormatter(logging.Formatter):
@@ -38,6 +47,14 @@ def configure_logging():
 
 def log_event(event):
     logger.info(event, extra={"event": event})
+
+
+def vault_path(args):
+    if args.account:
+        account = check_account(args.account)
+        os.makedirs(ACCOUNT_DIRECTORY, mode=0o700, exist_ok=True)
+        return os.path.join(ACCOUNT_DIRECTORY, account + ".pvlt")
+    return args.vault
 
 
 def find_entry(vault, label):
@@ -136,16 +153,17 @@ def run_session_command(vault, command, args):
 
 
 def cmd_init(args):
-    if os.path.exists(args.vault):
+    vault_path_value = vault_path(args)
+    if os.path.exists(vault_path_value):
         raise VaultError("A vault already exists at that location.")
     master = ask_new_password("New master password: ", MIN_MASTER_LENGTH)
-    Vault.create(args.vault, master).lock()
+    Vault.create(vault_path_value, master).lock()
     log_event("vault_created")
     print("Vault created.")
 
 
 def cmd_unlock(args):
-    with open_vault(args.vault) as vault:
+    with open_vault(vault_path(args)) as vault:
         print("Vault unlocked. " + SESSION_HELP)
         while True:
             try:
@@ -169,30 +187,31 @@ def cmd_unlock(args):
 
 
 def cmd_add(args):
-    with open_vault(args.vault) as vault:
+    with open_vault(vault_path(args)) as vault:
         add_entry(vault, args.label, args.username)
 
 
 def cmd_get(args):
-    with open_vault(args.vault) as vault:
+    with open_vault(vault_path(args)) as vault:
         show_entry(vault, args.label)
         if args.copy:
             copy_entry(vault, args.label)
 
 
 def cmd_list(args):
-    with open_vault(args.vault) as vault:
+    with open_vault(vault_path(args)) as vault:
         list_entries(vault)
 
 
 def cmd_delete(args):
-    with open_vault(args.vault) as vault:
+    with open_vault(vault_path(args)) as vault:
         delete_entry(vault, args.label)
 
 
 def build_parser():
     parser = argparse.ArgumentParser(prog="spm", description="Secure Password Manager")
     parser.add_argument("--vault", default=DEFAULT_VAULT, help="path to the vault file")
+    parser.add_argument("--account", help="use a separate vault for this account")
     commands = parser.add_subparsers(dest="command", required=True)
 
     commands.add_parser("init", help="create a new vault").set_defaults(func=cmd_init)

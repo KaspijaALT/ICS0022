@@ -11,6 +11,7 @@ import json
 import os
 import re
 import struct
+import tempfile
 
 from cryptography.exceptions import InvalidTag
 
@@ -70,14 +71,17 @@ def validate_entries(entries):
 
 
 def write_file_safely(path, data):
-    # Write to a temp file first and then swap it in, so a crash
-    # in the middle never leaves a half-written vault.
-    tmp_path = path + ".tmp"
-    # 0o600 = only the owner can read and write the file
-    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
-    os.replace(tmp_path, path)
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp_path = tempfile.mkstemp(dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 def read_meta(path):
@@ -109,6 +113,7 @@ class Vault:
         self.salt = salt
         self.counter = counter
         self.entries = entries
+        self.locked = False
 
     # Allows "with Vault.open(...) as vault:", which calls lock() at the end
     def __enter__(self):
@@ -119,13 +124,14 @@ class Vault:
 
     def lock(self):
         wipe(self.key)
-        self.entries = {}
+        self.entries.clear()
+        self.locked = True
 
     @classmethod
     def create(cls, path, master_password):
         check_password(master_password, 12)
         # 0o700 = only the owner can open the vault folder
-        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(path)), mode=0o700, exist_ok=True)
         salt = os.urandom(16)
         key = derive_key(master_password, salt)
         vault = cls(path, hash_master_password(master_password), key, salt, 0, {})
@@ -177,6 +183,8 @@ class Vault:
         return cls(path, meta["password_hash"], key, salt, counter, entries)
 
     def save(self):
+        if self.locked:
+            raise VaultError("Vault is locked.")
         validate_entries(self.entries)
         counter = self.counter + 1
         nonce = os.urandom(12)  # a new nonce every time, never reused with the same key

@@ -1,5 +1,6 @@
 import json
 import os
+import stat
 import tempfile
 import unittest
 
@@ -57,8 +58,17 @@ class VaultTests(unittest.TestCase):
 
     def test_lock_wipes_key(self):
         vault = Vault.open(self.path, MASTER)
+        entries = vault.entries
         vault.lock()
         self.assertEqual(vault.key, bytearray(32))
+        self.assertEqual(entries, {})
+        with self.assertRaises(VaultError):
+            vault.save()
+
+    @unittest.skipIf(os.name == "nt", "POSIX file permissions required")
+    def test_vault_files_are_private(self):
+        for path in (self.path, self.path + ".meta"):
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
 
     def test_broken_metadata_returns_safe_vault_error(self):
         with open(self.path + ".meta", "w") as metadata:

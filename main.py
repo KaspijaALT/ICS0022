@@ -1,32 +1,17 @@
 import argparse
 import getpass
 import os
-import re
 import shlex
 import subprocess
 import sys
 import time
 
-from storage import Vault, VaultError
+from storage import Vault, VaultError, check_label, check_password, check_username
 
 DEFAULT_VAULT = os.path.expanduser("~/.spm/vault.pvlt")
-# Labels: 1-64 letters, digits or . _ @ -
-LABEL_PATTERN = re.compile(r"[A-Za-z0-9._@-]{1,64}")
 MIN_MASTER_LENGTH = 12
 CLIPBOARD_SECONDS = 20
 SESSION_HELP = "Commands: list | get <label> | copy <label> | add <label> [username] | delete <label> | exit"
-
-
-def check_label(label):
-    if not LABEL_PATTERN.fullmatch(label):
-        raise VaultError("Label may only use letters, digits and . _ @ - (max 64 characters).")
-    return label
-
-
-def check_username(username):
-    if len(username) > 256 or not username.isprintable():
-        raise VaultError("Username must be at most 256 printable characters.")
-    return username
 
 
 def find_entry(vault, label):
@@ -38,10 +23,8 @@ def find_entry(vault, label):
 
 def ask_new_password(prompt, min_length=1):
     # getpass hides what is typed, passwords never go in command arguments
-    password = getpass.getpass(prompt)
-    if len(password) < min_length:
-        raise VaultError(f"Password must be at least {min_length} characters.")
-    if getpass.getpass("Repeat password: ") != password:
+    password = check_password(getpass.getpass(prompt), min_length)
+    if check_password(getpass.getpass("Repeat password: "), min_length) != password:
         raise VaultError("Passwords do not match.")
     return password
 

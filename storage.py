@@ -9,6 +9,7 @@ Meta file (<vault>.meta, JSON): password_hash, counter, sha256 of the vault file
 import hashlib
 import json
 import os
+import re
 import struct
 
 from cryptography.exceptions import InvalidTag
@@ -21,10 +22,51 @@ FORMAT_VERSION = 1
 # > big-endian, 4s magic, H 2-byte version, Q 8-byte counter, 16s salt, 12s nonce
 HEADER = struct.Struct(">4sHQ16s12s")
 TAG_SIZE = 16
+LABEL_PATTERN = re.compile(r"[A-Za-z0-9._@-]{1,64}")
+MAX_USERNAME_LENGTH = 256
+MAX_PASSWORD_LENGTH = 4096
 
 
 class VaultError(Exception):
     pass
+
+
+def check_label(label):
+    if not isinstance(label, str) or not LABEL_PATTERN.fullmatch(label):
+        raise VaultError("Label may only use letters, digits and . _ @ - (max 64 characters).")
+    return label
+
+
+def check_username(username):
+    if (
+        not isinstance(username, str)
+        or len(username) > MAX_USERNAME_LENGTH
+        or not username.isprintable()
+    ):
+        raise VaultError("Username must be at most 256 printable characters.")
+    return username
+
+
+def check_password(password, min_length=1):
+    if (
+        not isinstance(password, str)
+        or len(password) < min_length
+        or len(password) > MAX_PASSWORD_LENGTH
+        or not password.isprintable()
+    ):
+        raise VaultError(f"Password must be {min_length}-{MAX_PASSWORD_LENGTH} printable characters.")
+    return password
+
+
+def validate_entries(entries):
+    if not isinstance(entries, dict):
+        raise VaultError("Vault contents are invalid.")
+    for label, entry in entries.items():
+        check_label(label)
+        if not isinstance(entry, dict) or set(entry) != {"username", "password"}:
+            raise VaultError("Vault contents are invalid.")
+        check_username(entry["username"])
+        check_password(entry["password"])
 
 
 def write_file_safely(path, data):
@@ -42,7 +84,7 @@ def read_meta(path):
     try:
         with open(path + ".meta") as f:
             return json.load(f)
-    except (OSError, ValueError):
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError):
         raise VaultError("Vault metadata file is missing or broken.")
 
 
@@ -81,6 +123,7 @@ class Vault:
 
     @classmethod
     def create(cls, path, master_password):
+        check_password(master_password, 12)
         # 0o700 = only the owner can open the vault folder
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
         salt = os.urandom(16)
@@ -91,8 +134,19 @@ class Vault:
 
     @classmethod
     def open(cls, path, master_password):
+        check_password(master_password)
         # 1. Check the master password against the stored Argon2id hash
         meta = read_meta(path)
+        if (
+            not isinstance(meta, dict)
+            or not isinstance(meta.get("password_hash"), str)
+            or not isinstance(meta.get("counter"), int)
+            or isinstance(meta.get("counter"), bool)
+            or meta["counter"] < 0
+            or not isinstance(meta.get("sha256"), str)
+            or not re.fullmatch(r"[a-f0-9]{64}", meta["sha256"])
+        ):
+            raise VaultError("Vault metadata file is missing or broken.")
         if not check_master_password(meta["password_hash"], master_password):
             raise VaultError("Wrong master password.")
 
@@ -109,20 +163,29 @@ class Vault:
         key = derive_key(master_password, salt)
         try:
             plaintext = bytearray(decrypt(key, nonce, ciphertext, header))
-        except InvalidTag:
+            try:
+                entries = json.loads(plaintext.decode("utf-8"))
+                validate_entries(entries)
+            finally:
+                wipe(plaintext)
+        except InvalidTag as error:
             wipe(key)
-            raise VaultError("Vault file was modified. Refusing to open.")
-        entries = json.loads(plaintext)
-        wipe(plaintext)
+            raise VaultError("Vault file was modified. Refusing to open.") from error
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, VaultError) as error:
+            wipe(key)
+            raise VaultError("Vault contents are invalid.") from error
         return cls(path, meta["password_hash"], key, salt, counter, entries)
 
     def save(self):
-        self.counter += 1
+        validate_entries(self.entries)
+        counter = self.counter + 1
         nonce = os.urandom(12)  # a new nonce every time, never reused with the same key
-        header = HEADER.pack(MAGIC, FORMAT_VERSION, self.counter, self.salt, nonce)
+        header = HEADER.pack(MAGIC, FORMAT_VERSION, counter, self.salt, nonce)
         plaintext = bytearray(json.dumps(self.entries).encode())
-        sealed = encrypt(self.key, nonce, plaintext, header)
-        wipe(plaintext)
+        try:
+            sealed = encrypt(self.key, nonce, plaintext, header)
+        finally:
+            wipe(plaintext)
         # AESGCM returns ciphertext + tag, the file stores the tag first
         ciphertext, tag = sealed[:-TAG_SIZE], sealed[-TAG_SIZE:]
 
@@ -131,7 +194,8 @@ class Vault:
         # Remember the latest counter and file hash for the rollback check
         meta = {
             "password_hash": self.password_hash,
-            "counter": self.counter,
+            "counter": counter,
             "sha256": hashlib.sha256(data).hexdigest(),
         }
         write_file_safely(self.path + ".meta", json.dumps(meta, indent=2).encode())
+        self.counter = counter

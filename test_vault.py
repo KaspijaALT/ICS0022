@@ -1,9 +1,14 @@
+import contextlib
+import io
 import json
+import logging
 import os
 import stat
 import tempfile
 import unittest
+from unittest.mock import patch
 
+from main import JsonLogFormatter, main as run_cli
 from storage import (
     Vault,
     VaultError,
@@ -97,6 +102,27 @@ class VaultTests(unittest.TestCase):
         with self.assertRaises(VaultError):
             vault.save()
         self.assertEqual(vault.counter, counter)
+
+    def test_audit_log_format_is_structured(self):
+        record = logging.LogRecord(
+            "spm.audit", logging.INFO, "", 0, "credential_added", (), None
+        )
+        record.event = "credential_added"
+        event = json.loads(JsonLogFormatter().format(record))
+        self.assertEqual(event["event"], "credential_added")
+        self.assertEqual(event["level"], "INFO")
+
+    def test_cli_hides_filesystem_error_details(self):
+        error_output = io.StringIO()
+        with (
+            patch("main.cmd_list", side_effect=OSError("private path")),
+            patch("main.logger.warning"),
+            contextlib.redirect_stderr(error_output),
+        ):
+            result = run_cli(["list"])
+        self.assertEqual(result, 1)
+        self.assertIn("File operation failed.", error_output.getvalue())
+        self.assertNotIn("private path", error_output.getvalue())
 
 
 if __name__ == "__main__":

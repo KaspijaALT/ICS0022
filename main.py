@@ -1,5 +1,8 @@
 import argparse
+import datetime
 import getpass
+import json
+import logging
 import os
 import shlex
 import subprocess
@@ -12,6 +15,29 @@ DEFAULT_VAULT = os.path.expanduser("~/.spm/vault.pvlt")
 MIN_MASTER_LENGTH = 12
 CLIPBOARD_SECONDS = 20
 SESSION_HELP = "Commands: list | get <label> | copy <label> | add <label> [username] | delete <label> | exit"
+logger = logging.getLogger("spm.audit")
+
+
+class JsonLogFormatter(logging.Formatter):
+    def format(self, record):
+        return json.dumps({
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "level": record.levelname,
+            "event": record.event,
+        })
+
+
+def configure_logging():
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(JsonLogFormatter())
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+
+
+def log_event(event):
+    logger.info(event, extra={"event": event})
 
 
 def find_entry(vault, label):
@@ -32,13 +58,18 @@ def ask_new_password(prompt, min_length=1):
 def open_vault(vault_path):
     if not os.path.isfile(vault_path):
         raise VaultError("No vault found. Run 'init' first.")
-    return Vault.open(vault_path, getpass.getpass("Master password: "))
+    vault = Vault.open(vault_path, getpass.getpass("Master password: "))
+    log_event("vault_unlocked")
+    return vault
 
 
 def copy_to_clipboard(text):
     command = ["pbcopy"] if sys.platform == "darwin" else ["xclip", "-selection", "clipboard"]
     # Sent through stdin so the password does not show up in the process list
-    subprocess.run(command, input=text.encode(), check=True)
+    try:
+        subprocess.run(command, input=text.encode(), check=True)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise VaultError("Clipboard operation failed.") from error
 
 
 def add_entry(vault, label, username):
@@ -49,11 +80,13 @@ def add_entry(vault, label, username):
     password = ask_new_password(f"Password for {label}: ")
     vault.entries[label] = {"username": username, "password": password}
     vault.save()
+    log_event("credential_added")
     print(f"Saved '{label}'.")
 
 
 def show_entry(vault, label):
     entry = find_entry(vault, label)
+    log_event("credential_read")
     print(f"Label:    {label}")
     print(f"Username: {entry['username']}")
     print("Password: ********")
@@ -62,6 +95,7 @@ def show_entry(vault, label):
 def copy_entry(vault, label):
     entry = find_entry(vault, label)
     copy_to_clipboard(entry["password"])
+    log_event("credential_copied")
     print(f"Password copied. Clipboard will be cleared in {CLIPBOARD_SECONDS} seconds...")
     try:
         time.sleep(CLIPBOARD_SECONDS)
@@ -71,6 +105,7 @@ def copy_entry(vault, label):
 
 
 def list_entries(vault):
+    log_event("credentials_listed")
     if not vault.entries:
         print("Vault is empty.")
     for label, entry in sorted(vault.entries.items()):
@@ -81,6 +116,7 @@ def delete_entry(vault, label):
     find_entry(vault, label)
     del vault.entries[label]
     vault.save()
+    log_event("credential_deleted")
     print(f"Deleted '{label}'.")
 
 
@@ -101,10 +137,11 @@ def run_session_command(vault, command, args):
 
 def cmd_init(args):
     if os.path.exists(args.vault):
-        raise VaultError(f"A vault already exists at {args.vault}.")
+        raise VaultError("A vault already exists at that location.")
     master = ask_new_password("New master password: ", MIN_MASTER_LENGTH)
     Vault.create(args.vault, master).lock()
-    print(f"Vault created at {args.vault}")
+    log_event("vault_created")
+    print("Vault created.")
 
 
 def cmd_unlock(args):
@@ -126,6 +163,7 @@ def cmd_unlock(args):
             try:
                 run_session_command(vault, words[0], words[1:])
             except VaultError as error:
+                logger.warning("command_failed", extra={"event": "command_failed"})
                 print(f"Error: {error}")
     print("Vault locked.")
 
@@ -178,11 +216,17 @@ def build_parser():
 
 
 def main(argv=None):
+    configure_logging()
     args = build_parser().parse_args(argv)
     try:
         args.func(args)
     except VaultError as error:
+        logger.warning("operation_failed", extra={"event": "operation_failed"})
         print(f"Error: {error}", file=sys.stderr)
+        return 1
+    except OSError:
+        logger.warning("file_operation_failed", extra={"event": "file_operation_failed"})
+        print("Error: File operation failed.", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("\nCancelled.", file=sys.stderr)
